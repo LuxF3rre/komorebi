@@ -193,6 +193,8 @@ lazy_static! {
         Arc::new(Mutex::new(HashMap::new()));
     pub static ref SUBSCRIPTION_SOCKET_OPTIONS: Arc<Mutex<HashMap<String, SubscribeOptions>>> =
         Arc::new(Mutex::new(HashMap::new()));
+    pub static ref SUBSCRIPTION_SOCKET_FAILURES: Arc<Mutex<HashMap<String, u32>>> =
+        Arc::new(Mutex::new(HashMap::new()));
     static ref TCP_CONNECTIONS: Arc<Mutex<HashMap<String, TcpStream>>> =
         Arc::new(Mutex::new(HashMap::new()));
     static ref HIDING_BEHAVIOUR: Arc<Mutex<HidingBehaviour>> =
@@ -349,6 +351,14 @@ pub struct Notification {
     pub state: State,
 }
 
+// Number of consecutive delivery failures tolerated before a Unix-socket
+// subscriber is considered dead and removed from the subscription map.
+// A single failure is too aggressive: a subscriber's accept backlog can fill
+// up briefly during bursts of events, which would otherwise silently drop a
+// healthy subscription forever (the original symptom of the zebar workspace
+// freeze bug).
+const MAX_SUBSCRIBER_FAILURES: u32 = 5;
+
 pub fn notify_subscribers(
     notification: Notification,
     state_has_been_modified: bool,
@@ -368,6 +378,7 @@ pub fn notify_subscribers(
     let mut stale_sockets = vec![];
     let mut sockets = SUBSCRIPTION_SOCKETS.lock();
     let options = SUBSCRIPTION_SOCKET_OPTIONS.lock();
+    let mut failures = SUBSCRIPTION_SOCKET_FAILURES.lock();
 
     for (socket, path) in &mut *sockets {
         let apply_state_filter = (*options)
@@ -379,26 +390,66 @@ pub fn notify_subscribers(
         if !apply_state_filter || state_has_been_modified || is_override_event {
             match UnixStream::connect(path) {
                 Ok(mut stream) => {
-                    tracing::debug!("pushed notification to subscriber: {socket}");
-                    stream.write_all(notification.as_bytes())?;
+                    failures.remove(socket);
+                    if let Err(error) =
+                        stream.set_write_timeout(Some(std::time::Duration::from_secs(1)))
+                    {
+                        tracing::warn!(
+                            "could not set write timeout for subscriber {socket}: {error}"
+                        );
+                    }
+                    match stream.write_all(notification.as_bytes()) {
+                        Ok(()) => {
+                            tracing::debug!("pushed notification to subscriber: {socket}");
+                        }
+                        Err(error) => {
+                            // Treat a write failure on a successfully-connected
+                            // stream like a connect failure: bump the failure
+                            // counter rather than aborting the whole loop, so
+                            // other subscribers and named pipes still receive
+                            // this event.
+                            let count = failures.entry(socket.clone()).or_default();
+                            *count += 1;
+                            tracing::warn!(
+                                "could not write notification to subscriber {socket} (failure {count}/{MAX_SUBSCRIBER_FAILURES}): {error}"
+                            );
+                            if *count >= MAX_SUBSCRIBER_FAILURES {
+                                stale_sockets.push(socket.clone());
+                            }
+                        }
+                    }
                 }
-                Err(_) => {
-                    stale_sockets.push(socket.clone());
+                Err(error) => {
+                    // A single connect failure is not enough to remove a
+                    // subscriber: the subscriber's accept backlog can be
+                    // momentarily full under bursty event load, which would
+                    // otherwise cause us to silently and permanently drop a
+                    // healthy subscription. Only mark stale after several
+                    // consecutive failures.
+                    let count = failures.entry(socket.clone()).or_default();
+                    *count += 1;
+                    tracing::debug!(
+                        "could not connect to subscriber {socket} (failure {count}/{MAX_SUBSCRIBER_FAILURES}): {error}"
+                    );
+                    if *count >= MAX_SUBSCRIBER_FAILURES {
+                        stale_sockets.push(socket.clone());
+                    }
                 }
             }
         }
     }
 
     for socket in stale_sockets {
-        tracing::warn!("removing stale subscription: {socket}");
+        tracing::warn!(
+            "removing stale subscription {socket} after {MAX_SUBSCRIBER_FAILURES} consecutive failures"
+        );
         sockets.remove(&socket);
-        let socket_path = DATA_DIR.join(socket);
-        if let Err(error) = std::fs::remove_file(&socket_path) {
-            tracing::error!(
-                "could not remove stale subscriber socket file at {}: {error}",
-                socket_path.display()
-            )
-        }
+        failures.remove(&socket);
+        // The socket file on disk is bound to the subscriber's UnixListener.
+        // Removing it would orphan a subscriber whose listener is still alive
+        // (e.g. when our connect failure was transient). The subscribe()
+        // helper in komorebi-client unlinks any leftover file before binding,
+        // so we don't need to clean it up here.
     }
 
     let mut stale_pipes = vec![];

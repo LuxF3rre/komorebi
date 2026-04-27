@@ -37,6 +37,7 @@ use crate::OBJECT_NAME_CHANGE_ON_LAUNCH;
 use crate::REMOVE_TITLEBARS;
 use crate::SESSION_FLOATING_APPLICATIONS;
 use crate::SUBSCRIPTION_PIPES;
+use crate::SUBSCRIPTION_SOCKET_FAILURES;
 use crate::SUBSCRIPTION_SOCKET_OPTIONS;
 use crate::SUBSCRIPTION_SOCKETS;
 use crate::TCP_CONNECTIONS;
@@ -1970,6 +1971,7 @@ if (!(Get-Process komorebi-bar -ErrorAction SilentlyContinue))
                 let mut sockets = SUBSCRIPTION_SOCKETS.lock();
                 let socket_path = DATA_DIR.join(socket);
                 sockets.insert(socket.clone(), socket_path);
+                SUBSCRIPTION_SOCKET_FAILURES.lock().remove(socket);
             }
             SocketMessage::AddSubscriberSocketWithOptions(ref socket, options) => {
                 let mut sockets = SUBSCRIPTION_SOCKETS.lock();
@@ -1978,10 +1980,12 @@ if (!(Get-Process komorebi-bar -ErrorAction SilentlyContinue))
 
                 let mut socket_options = SUBSCRIPTION_SOCKET_OPTIONS.lock();
                 socket_options.insert(socket.clone(), options);
+                SUBSCRIPTION_SOCKET_FAILURES.lock().remove(socket);
             }
             SocketMessage::RemoveSubscriberSocket(ref socket) => {
                 let mut sockets = SUBSCRIPTION_SOCKETS.lock();
                 sockets.remove(socket);
+                SUBSCRIPTION_SOCKET_FAILURES.lock().remove(socket);
             }
             SocketMessage::AddSubscriberPipe(ref subscriber) => {
                 let mut pipes = SUBSCRIPTION_PIPES.lock();
