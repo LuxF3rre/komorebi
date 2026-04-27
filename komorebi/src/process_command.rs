@@ -923,11 +923,13 @@ impl WindowManager {
             SocketMessage::Retile => {
                 border_manager::destroy_all_borders()?;
                 force_update_borders = true;
+                self.pick_up_unmanaged_windows()?;
                 self.retile_all(false)?
             }
             SocketMessage::RetileWithResizeDimensions => {
                 border_manager::destroy_all_borders()?;
                 force_update_borders = true;
+                self.pick_up_unmanaged_windows()?;
                 self.retile_all(true)?
             }
             SocketMessage::FlipLayout(layout_flip) => self.flip_layout(layout_flip)?,

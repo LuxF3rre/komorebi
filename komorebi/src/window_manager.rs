@@ -789,6 +789,27 @@ impl WindowManager {
         Ok(winevent_listener::event_tx().send(event)?)
     }
 
+    /// Enumerate all top-level windows on the desktop and queue a Manage event
+    /// for any that should be tiled but aren't currently tracked by komorebi.
+    ///
+    /// This rescues windows that were created during a moment where komorebi
+    /// missed the corresponding winevent (e.g. while paused, during a virtual
+    /// desktop / display reconfiguration race, or right after startup before
+    /// the event hooks were live). The Manage event handler in `process_event`
+    /// already dedupes against the existing workspace contents, so it is safe
+    /// to send for windows that turn out to already be managed.
+    #[tracing::instrument(skip(self))]
+    pub fn pick_up_unmanaged_windows(&self) -> eyre::Result<()> {
+        let event_tx = winevent_listener::event_tx();
+        for window in WindowsApi::alt_tab_windows()? {
+            if !self.known_hwnds.contains_key(&window.hwnd) {
+                tracing::info!("picking up unmanaged window: {}", window.hwnd);
+                event_tx.send(WindowManagerEvent::Manage(window))?;
+            }
+        }
+        Ok(())
+    }
+
     #[tracing::instrument(skip(self))]
     pub fn unmanage_focused_window(&mut self) -> eyre::Result<()> {
         let hwnd = WindowsApi::foreground_window()?;
